@@ -225,6 +225,31 @@ export default function ClassPage() {
         }
       });
 
+      // 학생명렬 시트에서 학생 목록을 추가로 불러와 병합
+      // (활동 데이터가 없는 학생도 사이드바에 표시됨)
+      try {
+        const rosterRes = await fetch(
+          `/api/sheets/roster?grade=${grade}&classNum=${classNum}`
+        );
+        if (rosterRes.ok) {
+          const rosterData = await rosterRes.json();
+          (rosterData.students || []).forEach((s: { num: string; name: string }) => {
+            const studentKey = `${grade}-${classNum}-${s.num}-${s.name}`;
+            if (!studentMap.has(studentKey)) {
+              studentMap.set(studentKey, {
+                id: studentKey,
+                grade,
+                class: classNum,
+                num: s.num,
+                name: s.name,
+              });
+            }
+          });
+        }
+      } catch (rosterErr) {
+        console.warn('학생명렬 불러오기 실패 (무시):', rosterErr);
+      }
+
       const studentList = Array.from(studentMap.values());
       studentList.sort((a: any, b: any) => {
         if (a.grade !== b.grade) return parseInt(a.grade) - parseInt(b.grade);
