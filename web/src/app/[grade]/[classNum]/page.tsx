@@ -1,4 +1,4 @@
-﻿"use client";
+"use client";
 
 import { useState, useEffect } from "react";
 import { useParams, useRouter } from "next/navigation";
@@ -245,12 +245,38 @@ export default function ClassPage() {
       const classData = await fetchClassData();
       const savedAtData: Record<string, string> = {};
       classData.forEach((row: any) => {
+        if (row['번호'] === '__ORDER__') return; // 특수 행 제외
         if (row['저장시간']) {
           const key = `${row['학년']}-${row['반']}-${row['번호']}-${row['이름']}`;
           savedAtData[key] = row['저장시간'];
         }
       });
       setSheetSavedAtMap(savedAtData);
+
+      // ── 시트에서 순서 / 삭제 정보 복원 ──────────────────────────
+      // 1) globalOrders: __ORDER__ 특수 행
+      const orderRow = classData.find((r: any) => r['번호'] === '__ORDER__');
+      if (orderRow) {
+        const classKey = `${grade}-${classNum}`;
+        const restoredAuto = (orderRow['자율순서'] || '').split(',').filter(Boolean);
+        const restoredCareer = (orderRow['진로순서'] || '').split(',').filter(Boolean);
+        if (restoredAuto.length > 0 || restoredCareer.length > 0) {
+          setGlobalOrders({ [classKey]: { auto: restoredAuto, career: restoredCareer } });
+        }
+      }
+
+      // 2) 학생별 개별 순서 + 삭제활동 맵 생성
+      const studentMetaMap: Record<string, { autoOrder: string[]; careerOrder: string[]; deletedSet: Set<string> }> = {};
+      classData.forEach((row: any) => {
+        if (row['번호'] === '__ORDER__') return;
+        const key = `${row['학년']}-${row['반']}-${row['번호']}-${row['이름']}`;
+        studentMetaMap[key] = {
+          autoOrder: (row['자율순서'] || '').split(',').filter(Boolean),
+          careerOrder: (row['진로순서'] || '').split(',').filter(Boolean),
+          deletedSet: new Set((row['삭제활동'] || '').split(',').filter(Boolean)),
+        };
+      });
+      // ────────────────────────────────────────────────────────────
 
       // 활동별 수정 상태 확인 (일괄 처리로 할당량 최적화)
       const modifiedMap: Record<number, boolean> = {};
@@ -306,6 +332,49 @@ export default function ClassPage() {
           // ignore parse errors
         }
       }
+
+      // ── 시트 순서/삭제 정보를 mergedActivities에 적용 ──────────
+      // 1) isDeleted 플래그 적용
+      mergedActivities = mergedActivities.map((act: any) => {
+        const sKey = `${act['학년']}-${act['반']}-${act['번호']}-${act['이름']}`;
+        const meta = studentMetaMap[sKey];
+        if (!meta) return act;
+        const deletedKey = `${act['활동명']}::${act['입력영역']}`;
+        return { ...act, isDeleted: meta.deletedSet.has(deletedKey) };
+      });
+
+      // 2) 학생+탭별 활동 순서 재정렬
+      const groupMap = new Map<string, any[]>();
+      const groupOrder: string[] = [];
+      mergedActivities.forEach((act: any) => {
+        const gKey = `${act['학년']}||${act['반']}||${act['번호']}||${act['이름']}||${act['입력영역']}`;
+        if (!groupMap.has(gKey)) { groupMap.set(gKey, []); groupOrder.push(gKey); }
+        groupMap.get(gKey)!.push(act);
+      });
+      const sortedActivities: any[] = [];
+      groupOrder.forEach(gKey => {
+        const acts = groupMap.get(gKey)!;
+        const parts = gKey.split('||');
+        const sKey = `${parts[0]}-${parts[1]}-${parts[2]}-${parts[3]}`;
+        const area = parts[4];
+        const meta = studentMetaMap[sKey];
+        if (meta) {
+          const order = area === '자율활동' ? meta.autoOrder : meta.careerOrder;
+          if (order.length > 0) {
+            acts.sort((a: any, b: any) => {
+              const iA = order.indexOf(a['활동명']);
+              const iB = order.indexOf(b['활동명']);
+              if (iA !== -1 && iB !== -1) return iA - iB;
+              if (iA !== -1) return -1;
+              if (iB !== -1) return 1;
+              return 0;
+            });
+          }
+        }
+        sortedActivities.push(...acts);
+      });
+      mergedActivities = sortedActivities;
+      // ────────────────────────────────────────────────────────────
 
       setActivities(mergedActivities);
       setRecommendations(fetchedRecommendations);
@@ -1059,7 +1128,7 @@ export default function ClassPage() {
     });
   };
 
-  // globalOrders 기준으로 활동을 정렬해서 텍스트 합치기
+  // globalOrders 기준으로 활동을 정렬해서 텍스트 합치기 (학급 전체 순서 설정용)
   const buildActsText = (studentActs: any[], area: '자율활동' | '진로활동', classKey: string): string => {
     const order = globalOrders[classKey]?.[area === '자율활동' ? 'auto' : 'career'] || [];
     const filtered = studentActs.filter(a => a['입력영역'] === area && !a.isDeleted);
@@ -1073,6 +1142,15 @@ export default function ClassPage() {
     });
     return sorted.map(a => a['입력내용']).filter(Boolean).join(" ");
   };
+
+  // 최종 미리보기와 동일한 방식으로 텍스트 생성
+  // (activities 배열 순서 그대로 + 삭제 활동 제외 + join)
+  const buildPreviewText = (studentActs: any[], area: '자율활동' | '진로활동'): string =>
+    studentActs
+      .filter(a => a['입력영역'] === area && !a.isDeleted)
+      .map(a => a['입력내용'])
+      .filter(Boolean)
+      .join(' ');
 
   const formatSavedAt = (iso: string) => {
     const d = new Date(iso);
@@ -1113,20 +1191,39 @@ export default function ClassPage() {
       let autoActs: string;
       let careerActs: string;
       if (finalText) {
-        autoActs = finalText;
-        careerActs = '';
+        // finalText는 현재 activeTab의 최종 미리보기 텍스트
+        if (activeTab === '자율활동') {
+          autoActs = finalText;
+          careerActs = buildPreviewText(studentActs, '진로활동');
+        } else {
+          autoActs = buildPreviewText(studentActs, '자율활동');
+          careerActs = finalText;
+        }
       } else {
-        autoActs = buildActsText(studentActs, '자율활동', classKey);
-        careerActs = buildActsText(studentActs, '진로활동', classKey);
+        autoActs = buildPreviewText(studentActs, '자율활동');
+        careerActs = buildPreviewText(studentActs, '진로활동');
       }
       
+      const autoOrder = studentActs
+        .filter(a => a['입력영역'] === '자율활동')
+        .map(a => a['활동명']).filter(Boolean).join(',');
+      const careerOrder = studentActs
+        .filter(a => a['입력영역'] === '진로활동')
+        .map(a => a['활동명']).filter(Boolean).join(',');
+      const deletedActs = studentActs
+        .filter(a => a.isDeleted)
+        .map(a => `${a['활동명']}::${a['입력영역']}`).join(',');
+
       const payloadData = [{
         '학년': activeStudent.grade,
         '반': activeStudent.class,
         '번호': activeStudent.num,
         '이름': activeStudent.name,
         '자율활동': autoActs,
-        '진로활동': careerActs
+        '진로활동': careerActs,
+        '자율순서': autoOrder,
+        '진로순서': careerOrder,
+        '삭제활동': deletedActs,
       }];
 
       const res = await fetch("/api/sheets", {
@@ -1140,7 +1237,9 @@ export default function ClassPage() {
           studentInfo: {
             num: activeStudent.num,
             name: activeStudent.name
-          }
+          },
+          globalAutoOrder: globalOrders[classKey]?.auto.join(',') ?? '',
+          globalCareerOrder: globalOrders[classKey]?.career.join(',') ?? '',
         })
       });
       
@@ -1218,12 +1317,29 @@ export default function ClassPage() {
         let autoActs: string;
         let careerActs: string;
         if (isActiveStudent && finalText) {
-          autoActs = finalText;
-          careerActs = '';
+          // finalText는 현재 activeTab의 최종 미리보기 텍스트
+          if (activeTab === '자율활동') {
+            autoActs = finalText;
+            careerActs = buildPreviewText(studentActs, '진로활동');
+          } else {
+            autoActs = buildPreviewText(studentActs, '자율활동');
+            careerActs = finalText;
+          }
         } else {
-          autoActs = buildActsText(studentActs, '자율활동', classKey);
-          careerActs = buildActsText(studentActs, '진로활동', classKey);
+          autoActs = buildPreviewText(studentActs, '자율활동');
+          careerActs = buildPreviewText(studentActs, '진로활동');
         }
+
+        // 개별 순서 (드래그 반영, 삭제 포함 전체 순서)
+        const autoOrder = studentActs
+          .filter(a => a['입력영역'] === '자율활동')
+          .map(a => a['활동명']).filter(Boolean).join(',');
+        const careerOrder = studentActs
+          .filter(a => a['입력영역'] === '진로활동')
+          .map(a => a['활동명']).filter(Boolean).join(',');
+        const deletedActs = studentActs
+          .filter(a => a.isDeleted)
+          .map(a => `${a['활동명']}::${a['입력영역']}`).join(',');
         
         return {
           '학년': student.grade,
@@ -1231,9 +1347,25 @@ export default function ClassPage() {
           '번호': student.num,
           '이름': student.name,
           '자율활동': autoActs,
-          '진로활동': careerActs
+          '진로활동': careerActs,
+          '자율순서': autoOrder,
+          '진로순서': careerOrder,
+          '삭제활동': deletedActs,
         };
       });
+
+      // globalOrders를 __ORDER__ 특수 행으로 추가
+      payloadData.push({
+        '학년': activeStudent.grade,
+        '반': activeStudent.class,
+        '번호': '__ORDER__',
+        '이름': '',
+        '자율활동': '',
+        '진로활동': '',
+        '자율순서': globalOrders[classKey]?.auto.join(',') ?? '',
+        '진로순서': globalOrders[classKey]?.career.join(',') ?? '',
+        '삭제활동': '',
+      } as any);
 
       const res = await fetch("/api/sheets", {
         method: "POST",
@@ -1424,9 +1556,29 @@ export default function ClassPage() {
               <button onClick={() => setIsSidebarOpen(false)} className="text-white/70 hover:text-white transition-colors text-sm" title="사이드바 숨기기">◀</button>
             </div>
           </div>
-          <div className="flex bg-white/90 rounded-lg px-3 py-2 items-center">
-            <input type="text" placeholder="학생 검색..." className="bg-transparent border-none outline-none flex-1 text-sm text-gray-800" />
-            <button className="text-gray-400 hover:text-gray-600 transition-colors">🔍</button>
+          <div className="flex flex-col gap-2">
+            <div className="flex gap-2">
+              <button
+                onClick={() => setShowUploadModal(true)}
+                className="flex-1 px-3 py-2 rounded-lg font-semibold text-sm bg-white/90 border border-gray-200 text-gray-600 shadow-sm hover:bg-white transition-all flex items-center justify-center gap-1"
+              >
+                📂 데이터 업로드
+              </button>
+              <button
+                onClick={handleCancelUpload}
+                className="px-3 py-2 rounded-lg font-semibold text-sm bg-white/90 border border-red-200 text-red-400 shadow-sm hover:bg-red-50 hover:text-red-600 transition-all flex items-center gap-1"
+                title="업로드된 활동 데이터를 서버에서 전체 삭제"
+              >
+                🗑️
+              </button>
+            </div>
+            <button
+              onClick={handleSave}
+              disabled={isSaving}
+              className={`w-full px-3 py-2 rounded-lg font-semibold text-sm text-white shadow-md transition-all flex items-center justify-center gap-2 ${isSaving ? 'bg-gray-400 cursor-not-allowed' : 'bg-primary hover:bg-primary-hover'}`}
+            >
+              {isSaving ? "저장 중..." : "📋 학급 전체 저장"}
+            </button>
           </div>
         </header>
         <div className="flex-1 overflow-y-auto p-3 flex flex-col gap-4">
@@ -1537,19 +1689,6 @@ export default function ClassPage() {
           )}
 
           <div className="flex gap-2">
-            <button
-              onClick={() => setShowUploadModal(true)}
-              className="px-4 py-2 rounded-lg font-semibold text-sm bg-white border border-gray-200 text-gray-600 shadow-sm hover:bg-gray-50 transition-all flex items-center gap-1"
-            >
-              📂 데이터 업로드
-            </button>
-            <button
-              onClick={handleCancelUpload}
-              className="px-4 py-2 rounded-lg font-semibold text-sm bg-white border border-red-200 text-red-400 shadow-sm hover:bg-red-50 hover:text-red-600 transition-all flex items-center gap-1"
-              title="업로드된 활동 데이터를 서버에서 전체 삭제"
-            >
-              🗑️ 업로드 취소
-            </button>
             <button 
               onClick={handleReset}
               className="px-4 py-2 rounded-lg font-semibold text-sm bg-white border border-gray-200 text-gray-600 shadow-sm hover:bg-gray-50 transition-all flex items-center gap-1"
@@ -1569,13 +1708,6 @@ export default function ClassPage() {
               className={`px-4 py-2 rounded-lg font-semibold text-sm text-white shadow-md transition-all flex items-center gap-2 ${isSaving ? 'bg-indigo-300 cursor-not-allowed' : 'bg-indigo-500 hover:bg-indigo-600'}`}
             >
               {isSaving ? "저장 중..." : "학생 개별 저장"}
-            </button>
-            <button 
-              onClick={handleSave}
-              disabled={isSaving}
-              className={`px-4 py-2 rounded-lg font-semibold text-sm text-white shadow-md transition-all flex items-center gap-2 ${isSaving ? 'bg-gray-400 cursor-not-allowed' : 'bg-primary hover:bg-primary-hover'}`}
-            >
-              {isSaving ? "저장 중..." : "학급 전체 시트에 저장"}
             </button>
           </div>
         </header>
@@ -1751,32 +1883,32 @@ export default function ClassPage() {
                                           );
                                         }
 
-                                        // 변경 (교체): AI 버전 위 / 원본 아래 카드
+                                        // 변경 (교체): 원본 위 / AI 버전 아래 카드
                                         return (
                                           <span key={gi} className="inline-flex flex-col border border-gray-200 rounded-md mx-0.5 my-0.5 overflow-hidden align-bottom shadow-sm text-[0.82rem]">
                                             <span
-                                              onClick={() => handleSelectActivityVersion(act._localId, g.index, 'ai')}
-                                              title="AI 버전 선택"
-                                              className={`px-1.5 py-0.5 cursor-pointer transition-colors leading-snug select-none ${
-                                                isAiSelected ? 'bg-red-50 text-red-600 font-semibold' : 'bg-white text-red-300 hover:bg-red-50'
-                                              }`}
-                                            >
-                                              {g.ai}
-                                            </span>
-                                            <span
                                               onClick={() => handleSelectActivityVersion(act._localId, g.index, 'original')}
                                               title="원본 선택"
-                                              className={`px-1.5 py-0.5 cursor-pointer transition-colors leading-snug border-t border-gray-100 select-none ${
+                                              className={`px-1.5 py-0.5 cursor-pointer transition-colors leading-snug select-none ${
                                                 !isAiSelected ? 'bg-green-50 text-green-600 font-semibold' : 'bg-white text-green-400 hover:bg-green-50'
                                               }`}
                                             >
                                               {g.original}
                                             </span>
+                                            <span
+                                              onClick={() => handleSelectActivityVersion(act._localId, g.index, 'ai')}
+                                              title="AI 버전 선택"
+                                              className={`px-1.5 py-0.5 cursor-pointer transition-colors leading-snug border-t border-gray-100 select-none ${
+                                                isAiSelected ? 'bg-red-50 text-red-600 font-semibold' : 'bg-white text-red-300 hover:bg-red-50'
+                                              }`}
+                                            >
+                                              {g.ai}
+                                            </span>
                                           </span>
                                         );
                                       })}
                                     </div>
-                                    <p className="text-[0.68rem] text-gray-400 mt-1">변경: 위(AI) / 아래(원본) 클릭 선택 &nbsp;·&nbsp; 삭제: 취소선 클릭으로 복원</p>
+                                    <p className="text-[0.68rem] text-gray-400 mt-1">변경: 위(원본) / 아래(AI) 클릭 선택 · 삭제: 취소선 클릭으로 복원</p>
                                   </div>
                                 )}
 

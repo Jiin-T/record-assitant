@@ -194,6 +194,18 @@ function getCurrentTimestamp(): string {
   return koreanTime.toISOString().replace('T', ' ').slice(0, 19);
 }
 
+// 새 헤더 목록 (순서/삭제 정보 포함)
+const FULL_HEADERS = ["학년", "반", "번호", "이름", "자율활동", "진로활동", "저장시간", "자율순서", "진로순서", "삭제활동"];
+
+async function ensureFullHeaders(sheet: any) {
+  await sheet.loadHeaderRow();
+  const current: string[] = sheet.headerValues || [];
+  const missing = FULL_HEADERS.filter(h => !current.includes(h));
+  if (missing.length > 0) {
+    await sheet.setHeaderRow([...current, ...missing]);
+  }
+}
+
 export async function POST(request: Request) {
   try {
     const body = await request.json();
@@ -201,72 +213,71 @@ export async function POST(request: Request) {
 
     const doc = await getDoc();
     const sheetTitle = `${grade}학년 ${classNum}반`;
-    const headers = ["학년", "반", "번호", "이름", "자율활동", "진로활동"];
     let sheet = doc.sheetsByTitle[sheetTitle];
 
     if (!sheet) {
-      sheet = await doc.addSheet({ title: sheetTitle, headerValues: headers });
+      sheet = await doc.addSheet({ title: sheetTitle, headerValues: FULL_HEADERS });
     }
+
+    // 헤더 마이그레이션 (기존 시트에 새 컬럼 없을 수 있음)
+    await ensureFullHeaders(sheet);
 
     const timestamp = getCurrentTimestamp();
 
     if (body.isIndividual && body.studentInfo) {
       const rows = await sheet.getRows();
+
+      // 학생 행 upsert
       const targetRow = rows.find(
         (row) =>
           row.get("번호") === String(body.studentInfo.num) &&
           row.get("이름") === body.studentInfo.name
       );
 
-      // "저장시간" 열이 없으면 추가
-      const currentHeaders = sheet.headerValues;
-      if (!currentHeaders.includes("저장시간")) {
-        await sheet.resize({ rowCount: sheet.rowCount, columnCount: sheet.columnCount + 1 });
-        await sheet.setHeaderRow([...currentHeaders, "저장시간"]);
-        
-        // 기존 행에 빈 저장시간 값 추가
-        const allRows = await sheet.getRows();
-        for (const row of allRows) {
-          if (!row.get("저장시간")) {
-            row.set("저장시간", "");
-          }
-        }
-        await Promise.all(allRows.map(row => row.save()));
-      }
-
+      const studentData = data[0];
       if (targetRow) {
-        targetRow.set("학년", data[0]["학년"] ?? "");
-        targetRow.set("반", data[0]["반"] ?? "");
-        targetRow.set("번호", data[0]["번호"] ?? "");
-        targetRow.set("이름", data[0]["이름"] ?? "");
-        targetRow.set("자율활동", data[0]["자율활동"] ?? "");
-        targetRow.set("진로활동", data[0]["진로활동"] ?? "");
+        targetRow.set("학년", studentData["학년"] ?? "");
+        targetRow.set("반", studentData["반"] ?? "");
+        targetRow.set("번호", studentData["번호"] ?? "");
+        targetRow.set("이름", studentData["이름"] ?? "");
+        targetRow.set("자율활동", studentData["자율활동"] ?? "");
+        targetRow.set("진로활동", studentData["진로활동"] ?? "");
         targetRow.set("저장시간", timestamp);
+        targetRow.set("자율순서", studentData["자율순서"] ?? "");
+        targetRow.set("진로순서", studentData["진로순서"] ?? "");
+        targetRow.set("삭제활동", studentData["삭제활동"] ?? "");
         await targetRow.save();
       } else {
-        const newRow = await sheet.addRow(data[0]);
-        newRow.set("저장시간", timestamp);
-        await newRow.save();
+        await sheet.addRow({ ...studentData, 저장시간: timestamp });
+      }
+
+      // __ORDER__ 행 upsert (globalOrders 저장)
+      if (body.globalAutoOrder !== undefined || body.globalCareerOrder !== undefined) {
+        const orderRow = rows.find((r) => r.get("번호") === "__ORDER__");
+        if (orderRow) {
+          orderRow.set("자율순서", body.globalAutoOrder ?? "");
+          orderRow.set("진로순서", body.globalCareerOrder ?? "");
+          await orderRow.save();
+        } else {
+          await sheet.addRow({
+            학년: String(grade), 반: String(classNum), 번호: "__ORDER__",
+            이름: "", 자율활동: "", 진로활동: "", 저장시간: "",
+            자율순서: body.globalAutoOrder ?? "",
+            진로순서: body.globalCareerOrder ?? "",
+            삭제활동: "",
+          });
+        }
       }
     } else {
-      // 헤더 정보 먼저 로드
-      await sheet.loadHeaderRow();
-      
-      // "저장시간" 열이 없으면 추가
-      const currentHeaders = sheet.headerValues;
-      const updatedHeaders = currentHeaders.includes("저장시간") 
-        ? currentHeaders 
-        : [...currentHeaders, "저장시간"];
-
+      // 전체 저장: clearRows → addRows (__ORDER__ 행 포함해서 frontend가 payload에 넣음)
       await sheet.clearRows();
-      await sheet.setHeaderRow(updatedHeaders);
-      
-      // 모든 데이터에 저장시간 추가
+      await sheet.setHeaderRow(FULL_HEADERS);
+
       const dataWithTimestamp = data.map((row: any) => ({
         ...row,
-        저장시간: timestamp
+        저장시간: row["번호"] === "__ORDER__" ? "" : timestamp,
       }));
-      
+
       await sheet.addRows(dataWithTimestamp);
     }
 
